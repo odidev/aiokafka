@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-python@v2
@@ -48,7 +48,7 @@ jobs:
       - name: Build wheels
         env:
           CIBW_BUILD: cp36-* cp37-* cp38-* cp39-*
-          CIBW_BEFORE_BUILD_LINUX: pip install -r requirements-cython.txt && yum install -y zlib-devel
+          CIBW_BEFORE_BUILD_LINUX: pip install -r requirements-cython.txt && apt-get install zlib1g-dev
           # On windows and mac we should have z library preinstalled
           CIBW_BEFORE_BUILD: pip install -r requirements-cython.txt
           CIBW_BUILD_VERBOSITY: 2
