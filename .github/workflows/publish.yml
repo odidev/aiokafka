@@ -4,9 +4,13 @@
 name: Publish
 
 on:
-  release:
-    types: [created]
-  workflow_dispatch: {}
+  push:
+    branches: [ master, '**' ]
+    tags:
+      - "v0.[0-9]+.[0-9]+"
+      - "v0.[0-9]+.[0-9]+.dev*"
+  pull_request:
+    branches: [ master ]
 
 jobs:
   package-source:
