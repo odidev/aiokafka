@@ -13,6 +13,7 @@ import uuid
 import warnings
 import weakref
 
+import async_timeout
 from kafka.protocol.api import RequestHeader
 from kafka.protocol.admin import (
     SaslHandShakeRequest, SaslAuthenticateRequest, ApiVersionRequest
@@ -21,7 +22,7 @@ from kafka.protocol.commit import (
     GroupCoordinatorResponse_v0 as GroupCoordinatorResponse)
 
 import aiokafka.errors as Errors
-from aiokafka.util import create_future, create_task, get_running_loop
+from aiokafka.util import create_future, create_task, get_running_loop, wait_for
 
 from aiokafka.abc import AbstractTokenProvider
 
@@ -212,10 +213,9 @@ class AIOKafkaConnection:
         # Create streams same as `open_connection`, but using custom protocol
         reader = asyncio.StreamReader(limit=READER_LIMIT, loop=loop)
         protocol = AIOKafkaProtocol(self._closed_fut, reader, loop=loop)
-        transport, _ = await asyncio.wait_for(
-            loop.create_connection(
-                lambda: protocol, self.host, self.port, ssl=ssl),
-            timeout=self._request_timeout)
+        async with async_timeout.timeout(self._request_timeout):
+            transport, _ = await loop.create_connection(
+                lambda: protocol, self.host, self.port, ssl=ssl)
         writer = asyncio.StreamWriter(transport, protocol, reader, loop)
         self._reader, self._writer, self._protocol = reader, writer, protocol
 
@@ -227,11 +227,15 @@ class AIOKafkaConnection:
             self._idle_handle = loop.call_soon(
                 self._idle_check, weakref.ref(self))
 
-        if self._version_hint and self._version_hint >= (0, 10):
-            await self._do_version_lookup()
+        try:
+            if self._version_hint and self._version_hint >= (0, 10):
+                await self._do_version_lookup()
 
-        if self._security_protocol in ["SASL_SSL", "SASL_PLAINTEXT"]:
-            await self._do_sasl_handshake()
+            if self._security_protocol in ["SASL_SSL", "SASL_PLAINTEXT"]:
+                await self._do_sasl_handshake()
+        except:  # noqa: E722
+            self.close()
+            raise
 
         return reader, writer
 
@@ -365,24 +369,28 @@ class AIOKafkaConnection:
 
         return f"{service}@{domain}"
 
-    @staticmethod
-    def _on_read_task_error(self_ref, read_task):
+    @classmethod
+    def _on_read_task_error(cls, self_ref, read_task):
         # We don't want to react to cancelled errors
         if read_task.cancelled():
             return
 
         try:
             read_task.result()
-        except (OSError, EOFError, ConnectionError) as exc:
-            self_ref().close(reason=CloseReason.CONNECTION_BROKEN, exc=exc)
         except Exception as exc:
+            if not isinstance(exc, (OSError, EOFError, ConnectionError)):
+                cls.log.exception("Unexpected exception in AIOKafkaConnection")
+
             self = self_ref()
-            self.log.exception("Unexpected exception in AIOKafkaConnection")
-            self.close(reason=CloseReason.CONNECTION_BROKEN, exc=exc)
+            if self is not None:
+                self.close(reason=CloseReason.CONNECTION_BROKEN, exc=exc)
 
     @staticmethod
     def _idle_check(self_ref):
         self = self_ref()
+        if self is None:
+            return
+
         idle_for = time.monotonic() - self._last_action
         timeout = self._max_idle_ms / 1000
         # If we have any pending requests, we are assumed to be not idle.
@@ -437,7 +445,7 @@ class AIOKafkaConnection:
             return self._writer.drain()
         fut = self._loop.create_future()
         self._requests.append((correlation_id, request.RESPONSE_TYPE, fut))
-        return asyncio.wait_for(fut, self._request_timeout)
+        return wait_for(fut, self._request_timeout)
 
     def _send_sasl_token(self, payload, expect_response=True):
         if self._writer is None:
@@ -458,7 +466,7 @@ class AIOKafkaConnection:
 
         fut = self._loop.create_future()
         self._requests.append((None, None, fut))
-        return asyncio.wait_for(fut, self._request_timeout)
+        return wait_for(fut, self._request_timeout)
 
     def connected(self):
         return bool(self._reader is not None and not self._reader.at_eof())
@@ -498,20 +506,29 @@ class AIOKafkaConnection:
             functools.partial(self._on_read_task_error, self_ref))
         return read_task
 
-    @classmethod
-    async def _read(cls, self_ref):
+    @staticmethod
+    async def _read(self_ref):
         # XXX: I know that it become a bit more ugly once cyclic references
         # were removed, but it's needed to allow connections to properly
         # release resources if leaked.
         # NOTE: all errors will be handled by done callback
+        self = self_ref()
+        if self is None:
+            return
+        reader = self._reader
+        del self
 
-        reader = self_ref()._reader
         while True:
             resp = await reader.readexactly(4)
             size, = struct.unpack(">i", resp)
 
             resp = await reader.readexactly(size)
-            self_ref()._handle_frame(resp)
+
+            self = self_ref()
+            if self is None:
+                return
+            self._handle_frame(resp)
+            del self
 
     def _handle_frame(self, resp):
         correlation_id, resp_type, fut = self._requests[0]
