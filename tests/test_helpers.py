@@ -42,6 +42,9 @@ class TestHelpers(unittest.TestCase):
         context = create_ssl_context(cadata=der_ca[0])
         self.assertEqual(context.get_ca_certs(binary_form=True), der_ca)
 
+        openssl_version = ssl.OPENSSL_VERSION_INFO
+        print("===============================", openssl_version, "===============================")
+
         context = create_ssl_context(
             cafile=str(cafile),
             certfile=str(certfile),
